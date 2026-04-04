@@ -139,6 +139,7 @@ ACTIVE_DIR="$CONFIG_DIR/active"
 
 mkdir -p "$ACTIVE_DIR"
 chown -R "$CONSOLE_USER" "$CONFIG_DIR"
+chown -R "$CONSOLE_USER" /Applications/AerialShuffle.app
 
 # Kill any existing instance (SIGTERM so it can restore refresh rate)
 killall AerialShuffle 2>/dev/null || true

@@ -8,8 +8,8 @@ A macOS Tahoe menu bar app that shuffles Apple aerial wallpapers on both the des
 
 - **Desktop wallpaper shuffle** — Cycles through 4K PNG stills extracted from Apple aerial videos using native macOS photo folder shuffle with smooth crossfade transitions
 - **Lock screen aerial shuffle** — Rotates which aerial video plays on the lock screen by updating the system shuffle database on a configurable timer
-- **Power button override** — Pressing the power button launches the screensaver momentarily, then dismisses it to the lock screen showing aerial videos (instead of the default instant-lock behavior)
-- **ESC to sleep** — On the lock screen, pressing ESC sleeps the display
+- **Lock screen interception** — Intercepts Ctrl+Cmd+Q (the standard macOS lock shortcut), pins the display to a fixed 60Hz refresh rate to prevent ProMotion's adaptive mode from throttling during the screensaver, then launches the screensaver so aerials start playing immediately on the lock screen. The original adaptive refresh rate is restored automatically when the user unlocks.
+- **ESC to sleep** — Pressing ESC on the lock screen sleeps the display
 - **Category filters** — Independent category selection for desktop photos and lock screen aerials:
   - 🏔️ Landscape
   - 🏙️ Cityscape
@@ -26,6 +26,7 @@ A macOS Tahoe menu bar app that shuffles Apple aerial wallpapers on both the des
 - macOS Tahoe (26.x) on Apple Silicon (M-series)
 - Apple aerial videos (downloaded automatically via included script)
 - System Settings → Screensaver set to "Shuffle All Aerials"
+- A keyboard with a lock screen key mapped to Ctrl+Cmd+Q (e.g. Keychron)
 
 ## Setup
 
@@ -53,22 +54,21 @@ done
 ### 3. Build
 
 ```bash
-swiftc -target arm64-apple-macos14 -framework AppKit -framework SwiftUI -lsqlite3 \
-    -o AerialShuffle AerialShuffle.swift
+bash build.sh
 ```
+
+This compiles the app, generates an app icon, and creates a PKG installer.
 
 ### 4. Install via PKG
 
 The included build process creates a PKG installer that:
 - Installs the app to `/Applications`
-- Sets `DisableScreenLockImmediate` for power button interception
 - Creates the config directory
 - Launches the app automatically
 
 On first launch, macOS will prompt for:
-- **Accessibility** — for posting keyboard events
-- **Input Monitoring** — for the global event tap
-- **Full Disk Access** — for reading the aerial shuffle database
+- **Accessibility** — for intercepting the lock screen shortcut (Ctrl+Cmd+Q)
+- **Input Monitoring** — for receiving keyboard events through the event tap
 
 ### 5. Configure desktop wallpaper
 
@@ -81,9 +81,14 @@ The app manages this folder with symlinks based on your category selection.
 
 ## How It Works
 
-### Power Button Detection
+### Lock Screen Interception
 
-The power button generates a single `NX_SYSDEFINED` (type 14) CGEvent. The app distinguishes it from caps lock (which generates 2+ type 14 events in a burst) and mouse clicks (tracked via timestamp proximity) using a 100ms counting window.
+The app uses an active CGEvent tap (`.defaultTap`) to intercept Ctrl+Cmd+Q keypresses. When detected, the event is consumed (preventing the default instant-lock behavior) and replaced with a custom sequence:
+
+1. **Refresh rate pin** — The display is switched from adaptive ProMotion to a fixed 60Hz mode, preventing macOS from throttling the refresh rate during the screensaver (which makes aerial videos look sluggish)
+2. **Screensaver launch** — `ScreenSaverEngine` is opened so the aerial video starts playing immediately; macOS's "require password" setting handles the actual screen lock
+
+When the user unlocks, the app listens for the `com.apple.screenIsUnlocked` distributed notification and restores the original adaptive display mode.
 
 ### Aerial Shuffle
 
@@ -98,8 +103,7 @@ The app maintains a folder of symlinks (`active/`) pointing to stills matching t
 Use the **Uninstall** option in the menu bar dropdown. It removes:
 - The app from `/Applications`
 - Config directory at `~/Library/Application Support/AerialShuffle/`
-- TCC permission entries
-- `DisableScreenLockImmediate` setting
+- TCC permission entries (Accessibility, Input Monitoring, Full Disk Access)
 - Launch at login registration
 
 Note: Aerial stills in `~/Library/Application Support/com.apple.wallpaper/aerials/stills/` are preserved.
@@ -108,7 +112,8 @@ Note: Aerial stills in `~/Library/Application Support/com.apple.wallpaper/aerial
 
 | File | Description |
 |------|-------------|
-| `AerialShuffle.swift` | Complete app source (single file, ~500 lines) |
+| `AerialShuffle.swift` | Complete app source (single file) |
+| `build.sh` | Compiles app, generates icon, creates PKG installer |
 | `download_tahoe_aerials.py` | Downloads Apple aerial videos from the system manifest |
 
 ## License
