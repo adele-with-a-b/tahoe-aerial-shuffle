@@ -43,70 +43,94 @@ func categorize(_ name: String) -> String {
     return "landscape"
 }
 
-// MARK: - Event Detector
+// MARK: - Lock Screen Handler
 
-class EventDetector {
-    var sawMouseEvent = false
-    var lastLaunch: Date = .distantPast
+class LockScreenHandler {
     var tapRef: CFMachPort?
     weak var appState: AppState?
+    var isScreenLocked = false
+    private var retryTimer: Timer?
 
     func start() {
-        let mask: CGEventMask = (1 << 14) | (1 << CGEventType.keyDown.rawValue) |
-            (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.rightMouseDown.rawValue) |
-            (1 << CGEventType.otherMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue) |
-            (1 << CGEventType.rightMouseUp.rawValue) | (1 << CGEventType.otherMouseUp.rawValue)
+        attemptTapCreation()
+    }
 
+    func stop() {
+        retryTimer?.invalidate()
+        retryTimer = nil
+        if let tap = tapRef { CGEvent.tapEnable(tap: tap, enable: false) }
+    }
+
+    private func attemptTapCreation() {
+        let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        tapRef = CGEvent.tapCreate(
-            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+
+        let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
             eventsOfInterest: mask,
             callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
                 guard let refcon = refcon else { return Unmanaged.passRetained(event) }
-                let d = Unmanaged<EventDetector>.fromOpaque(refcon).takeUnretainedValue()
+                let handler = Unmanaged<LockScreenHandler>.fromOpaque(refcon).takeUnretainedValue()
 
                 if type == .tapDisabledByTimeout {
-                    if let tap = d.tapRef { CGEvent.tapEnable(tap: tap, enable: true) }
+                    if let tap = handler.tapRef { CGEvent.tapEnable(tap: tap, enable: true) }
                     return Unmanaged.passRetained(event)
                 }
 
-                let t = type
-                if t == .leftMouseDown || t == .rightMouseDown || t == .otherMouseDown ||
-                   t == .leftMouseUp || t == .rightMouseUp || t == .otherMouseUp {
-                    d.sawMouseEvent = true
-                }
+                if type == .keyDown {
+                    let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+                    let flags = event.flags
 
-                // ESC -> display sleep
-                if type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 0x35 {
-                    DispatchQueue.global().async {
-                        let p = Process()
-                        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-                        p.arguments = ["displaysleepnow"]
-                        try? p.run()
+                    // Intercept Ctrl+Cmd+Q (lock screen shortcut)
+                    if keycode == 0x0C && flags.contains(.maskCommand) && flags.contains(.maskControl) {
+                        handler.appState?.handleLockScreen()
+                        return nil // consume the event
                     }
-                }
 
-                // Power button -> screensaver + shift
-                if type.rawValue == 14 && event.flags.rawValue == 0 {
-                    let now = Date()
-                    if now.timeIntervalSince(d.lastLaunch) > 2.0 {
-                        d.sawMouseEvent = false
-                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
-                            if !d.sawMouseEvent {
-                                d.lastLaunch = Date()
-                                d.appState?.launchScreensaverThenDismiss()
-                            }
+                    // ESC -> display sleep (only when screen is locked)
+                    if keycode == 0x35 && handler.isScreenLocked {
+                        DispatchQueue.global().async {
+                            let p = Process()
+                            p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+                            p.arguments = ["displaysleepnow"]
+                            try? p.run()
                         }
                     }
                 }
+
                 return Unmanaged.passRetained(event)
             },
             userInfo: refcon
         )
-        guard let tap = tapRef else { return }
-        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+
+        if let tap = tap {
+            retryTimer?.invalidate()
+            retryTimer = nil
+            tapRef = tap
+            let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+        } else {
+            // No permission — register in TCC via listenOnly probe, then open Settings
+            let probe = CGEvent.tapCreate(
+                tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+                eventsOfInterest: mask,
+                callback: { (_, _, event, _) in Unmanaged.passRetained(event) },
+                userInfo: nil
+            )
+            if let probe = probe { CGEvent.tapEnable(tap: probe, enable: false) }
+
+            if retryTimer == nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                retryTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+                    self?.attemptTapCreation()
+                }
+            }
+        }
     }
 }
 
@@ -149,6 +173,8 @@ class AppState: ObservableObject {
     }()
 
     var recentIDs: [String] = []
+    var savedDisplayMode: CGDisplayMode?
+    weak var lockHandler: LockScreenHandler?
 
     init() {
         try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true)
@@ -157,31 +183,52 @@ class AppState: ObservableObject {
         rebuildActiveFrames()
         updateCounts()
         updateCurrentName()
-        enablePowerButtonIntercept()
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        listenForUnlock()
     }
 
-    func enablePowerButtonIntercept() {
-        let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-        t.arguments = ["write", "com.apple.loginwindow", "DisableScreenLockImmediate", "-bool", "YES"]
-        try? t.run(); t.waitUntilExit()
-    }
-
-    func disablePowerButtonIntercept() {
-        let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-        t.arguments = ["delete", "com.apple.loginwindow", "DisableScreenLockImmediate"]
-        try? t.run(); t.waitUntilExit()
-    }
-
-    func launchScreensaverThenDismiss() {
+    func handleLockScreen() {
         DispatchQueue.global().async {
+            self.pinTo60Hz()
             let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            t.arguments = ["-a", "ScreenSaverEngine"]; try? t.run(); t.waitUntilExit()
-            Thread.sleep(forTimeInterval: 0.5)
-            let s = CGEvent(keyboardEventSource: nil, virtualKey: 0x38, keyDown: true)
-            s?.post(tap: .cghidEventTap)
-            let u = CGEvent(keyboardEventSource: nil, virtualKey: 0x38, keyDown: false)
-            u?.post(tap: .cghidEventTap)
+            t.arguments = ["-a", "ScreenSaverEngine"]; try? t.run()
+        }
+    }
+
+    func pinTo60Hz() {
+        let displayID = CGMainDisplayID()
+        guard let currentMode = CGDisplayCopyDisplayMode(displayID) else { return }
+        savedDisplayMode = currentMode
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        guard let allModes = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] else { return }
+        if let target = allModes.first(where: {
+            $0.width == currentMode.width && $0.height == currentMode.height &&
+            $0.pixelWidth == currentMode.pixelWidth && $0.pixelHeight == currentMode.pixelHeight &&
+            $0.refreshRate == 60.0
+        }) {
+            CGDisplaySetDisplayMode(displayID, target, nil)
+        }
+    }
+
+    func restoreRefreshRate() {
+        guard let mode = savedDisplayMode else { return }
+        CGDisplaySetDisplayMode(CGMainDisplayID(), mode, nil)
+        savedDisplayMode = nil
+    }
+
+    func listenForUnlock() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.screenIsLocked"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.lockHandler?.isScreenLocked = true
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.screenIsUnlocked"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.lockHandler?.isScreenLocked = false
+            self?.restoreRefreshRate()
         }
     }
 
@@ -256,10 +303,10 @@ class AppState: ObservableObject {
     }
 
     func uninstall() {
-        disablePowerButtonIntercept()
+        restoreRefreshRate()
+        lockHandler?.stop()
         try? SMAppService.mainApp.unregister()
         try? FileManager.default.removeItem(atPath: configDir)
-        // Remove TCC entries via tccutil
         for service in ["Accessibility", "ListenEvent", "SystemPolicyAllFiles"] {
             let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
             t.arguments = ["reset", service, "com.user.aerial-shuffle"]; try? t.run(); t.waitUntilExit()
@@ -267,13 +314,7 @@ class AppState: ObservableObject {
         try? FileManager.default.removeItem(atPath: Bundle.main.bundlePath)
         NSApp.terminate(nil)
     }
-
-    static func needsPermissions() -> Bool {
-        return !AXIsProcessTrusted()
-    }
 }
-
-// Permission request uses the native macOS system dialog via AXIsProcessTrustedWithOptions
 
 // MARK: - Checkbox Menu Item (NSView-based, doesn't close menu)
 
@@ -320,7 +361,7 @@ func makeRadioItem(title: String, checked: Bool, toggle: @escaping () -> Void) -
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var state: AppState!
-    var eventDetector: EventDetector!
+    var lockHandler: LockScreenHandler!
     var shuffleTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -346,19 +387,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
         }
-        // Always open Input Monitoring + Full Disk Access on first run
         if !UserDefaults.standard.bool(forKey: "setupDone") {
             UserDefaults.standard.set(true, forKey: "setupDone")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
         }
         finishLaunch()
     }
@@ -366,9 +396,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func finishLaunch() {
         NSApp.setActivationPolicy(.accessory)
         state = AppState()
-        eventDetector = EventDetector()
-        eventDetector.appState = state
-        eventDetector.start()
+        lockHandler = LockScreenHandler()
+        lockHandler.appState = state
+        state.lockHandler = lockHandler
+        lockHandler.start()
         startShuffleTimer()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -484,19 +515,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func doUninstall() {
         let alert = NSAlert()
         alert.messageText = "Uninstall AerialShuffle?"
-        alert.informativeText = "This will remove the app, config, permissions, and restore default power button behavior."
+        alert.informativeText = "This will remove the app, config, and permissions."
         alert.addButton(withTitle: "Uninstall"); alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
         if alert.runModal() == .alertFirstButtonReturn { state.uninstall() }
     }
 
     @objc func doQuit() {
-        state.disablePowerButtonIntercept()
+        state.restoreRefreshRate()
+        lockHandler.stop()
         NSApp.terminate(nil)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        state?.disablePowerButtonIntercept()
+        state?.restoreRefreshRate()
+        lockHandler?.stop()
     }
 }
 
