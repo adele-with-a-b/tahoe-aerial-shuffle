@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import SQLite3
 import ServiceManagement
 import ApplicationServices
 
@@ -111,21 +110,8 @@ class LockScreenHandler {
             CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
         } else {
-            // No permission — register in TCC via listenOnly probe, then open Settings
-            let probe = CGEvent.tapCreate(
-                tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-                eventsOfInterest: mask,
-                callback: { (_, _, event, _) in Unmanaged.passRetained(event) },
-                userInfo: nil
-            )
-            if let probe = probe { CGEvent.tapEnable(tap: probe, enable: false) }
-
+            // No Accessibility permission — retry silently, menu shows warning
             if retryTimer == nil {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
                 retryTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
                     self?.attemptTapCreation()
                 }
@@ -175,16 +161,53 @@ class AppState: ObservableObject {
     var recentIDs: [String] = []
     var savedDisplayMode: CGDisplayMode?
     weak var lockHandler: LockScreenHandler?
+    var fdaGranted = false
+    var permissionTimer: Timer?
 
     init() {
         try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(atPath: activeDir, withIntermediateDirectories: true)
         loadConfig()
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+        listenForUnlock()
+        checkFDA()
+        if fdaGranted { onFDAGranted() }
+        startPermissionPolling()
+    }
+
+    func checkFDA() {
+        // Test FDA by reading ~/Library/Safari — FDA-protected, no per-app popup
+        let testPath = home + "/Library/Safari"
+        fdaGranted = (try? FileManager.default.contentsOfDirectory(atPath: testPath)) != nil
+    }
+
+    func onFDAGranted() {
         rebuildActiveFrames()
         updateCounts()
         updateCurrentName()
-        launchAtLogin = SMAppService.mainApp.status == .enabled
-        listenForUnlock()
+        setDesktopShuffle()
+    }
+
+    func startPermissionPolling() {
+        // Poll until both permissions granted, then stop
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            if !self.fdaGranted {
+                self.checkFDA()
+                if self.fdaGranted { self.onFDAGranted() }
+            }
+            // Stop polling once everything is granted
+            if self.fdaGranted {
+                timer.invalidate()
+                self.permissionTimer = nil
+            }
+        }
+    }
+
+    func missingPermissions() -> [String] {
+        var missing: [String] = []
+        if !fdaGranted { missing.append("Full Disk Access") }
+        return missing
     }
 
     func handleLockScreen() {
@@ -232,6 +255,19 @@ class AppState: ObservableObject {
         }
     }
 
+    func setDesktopShuffle() {
+        let url = URL(fileURLWithPath: activeDir)
+        let options: [NSWorkspace.DesktopImageOptionKey: Any] = [
+            .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
+            .allowClipping: true
+        ]
+        for screen in NSScreen.screens {
+            if NSWorkspace.shared.desktopImageURL(for: screen)?.path != activeDir {
+                try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: options)
+            }
+        }
+    }
+
     func loadConfig() {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: configFile)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -263,14 +299,20 @@ class AppState: ObservableObject {
         desktopFilteredCount = count
     }
 
+    func shellSqlite(_ sql: String) -> String? {
+        let p = Process(); let pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        p.arguments = [dbPath, sql]
+        p.standardOutput = pipe; p.standardError = nil
+        try? p.run(); p.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func shuffle() {
-        var db: OpaquePointer?
-        guard sqlite3_open(dbPath, &db) == SQLITE_OK else { return }
-        defer { sqlite3_close(db) }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT ZCURRENTID FROM ZPERSISTENTSHUFFLEORDER WHERE Z_PK=1", -1, &stmt, nil) == SQLITE_OK,
-              sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) else { sqlite3_finalize(stmt); return }
-        let current = String(cString: c); sqlite3_finalize(stmt)
+        guard fdaGranted else { return }
+        guard let current = shellSqlite("SELECT ZCURRENTID FROM ZPERSISTENTSHUFFLEORDER WHERE Z_PK=1"),
+              !current.isEmpty else { return }
         let fileIDs = Set((try? FileManager.default.contentsOfDirectory(atPath: videosDir))?.filter { $0.hasSuffix(".mov") }.map { $0.replacingOccurrences(of: ".mov", with: "") } ?? [])
         let ids = allAerials.filter { fileIDs.contains($0.id) && aerialCats.contains($0.category) }.map { $0.id }
         guard ids.count >= 2 else { return }
@@ -278,7 +320,7 @@ class AppState: ObservableObject {
         let pool = candidates.isEmpty ? ids.filter { $0 != current } : candidates
         guard let next = pool.randomElement() else { return }
         recentIDs.append(next); if recentIDs.count > 20 { recentIDs.removeFirst() }
-        sqlite3_exec(db, "UPDATE ZPERSISTENTSHUFFLEORDER SET ZCURRENTID='\(next)' WHERE Z_PK=1", nil, nil, nil)
+        _ = shellSqlite("UPDATE ZPERSISTENTSHUFFLEORDER SET ZCURRENTID='\(next)' WHERE Z_PK=1")
         let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         t.arguments = ["-9", "WallpaperAerialsExtension"]; try? t.run()
     }
@@ -306,8 +348,10 @@ class AppState: ObservableObject {
         restoreRefreshRate()
         lockHandler?.stop()
         try? SMAppService.mainApp.unregister()
-        try? FileManager.default.removeItem(atPath: configDir)
-        for service in ["Accessibility", "ListenEvent", "SystemPolicyAllFiles"] {
+        // Remove config but preserve active/ — macOS wallpaper shuffle points to it
+        try? FileManager.default.removeItem(atPath: configFile)
+        UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "")
+        for service in ["Accessibility", "PostEvent", "SystemPolicyAllFiles", "SystemPolicyAppData"] {
             let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
             t.arguments = ["reset", service, "com.user.aerial-shuffle"]; try? t.run(); t.waitUntilExit()
         }
@@ -383,14 +427,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        if !AXIsProcessTrusted() {
-            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-            AXIsProcessTrustedWithOptions(opts)
-        }
-        if !UserDefaults.standard.bool(forKey: "setupDone") {
-            UserDefaults.standard.set(true, forKey: "setupDone")
-        }
         finishLaunch()
+
     }
 
     func finishLaunch() {
@@ -499,6 +537,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             s.setLaunchAtLogin(!s.launchAtLogin)
         })
 
+        if !state.fdaGranted {
+            menu.addItem(NSMenuItem.separator())
+            let pw = NSMenuItem(title: "⚠️ Grant Full Disk Access", action: #selector(openFDA), keyEquivalent: "")
+            pw.target = self; menu.addItem(pw)
+        }
+
         menu.addItem(NSMenuItem.separator())
 
         let ui = NSMenuItem(title: "Uninstall", action: #selector(doUninstall), keyEquivalent: "")
@@ -512,10 +556,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = nil
     }
 
+    @objc func openFDA() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]
+        try? p.run()
+    }
+
     @objc func doUninstall() {
         let alert = NSAlert()
         alert.messageText = "Uninstall AerialShuffle?"
-        alert.informativeText = "This will remove the app, config, and permissions."
+        alert.informativeText = "This will remove the app, config, and permissions (Accessibility, Full Disk Access)."
         alert.addButton(withTitle: "Uninstall"); alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
         if alert.runModal() == .alertFirstButtonReturn { state.uninstall() }

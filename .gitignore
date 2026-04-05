@@ -2,3 +2,6 @@
 *.pkg
 *.app
 *.o
+build/
+*.dmg
+*.pkg

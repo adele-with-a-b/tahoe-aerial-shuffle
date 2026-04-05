@@ -5,19 +5,16 @@ APP_NAME="AerialShuffle"
 BUNDLE_ID="com.user.aerial-shuffle"
 VERSION="1.0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BUILD_DIR="$SCRIPT_DIR/build"
-PAYLOAD_DIR="$BUILD_DIR/payload"
-SCRIPTS_DIR="$BUILD_DIR/scripts"
-APP_BUNDLE="$PAYLOAD_DIR/Applications/$APP_NAME.app"
-PKG_PATH="$SCRIPT_DIR/$APP_NAME.pkg"
+BUILD_DIR="/tmp/aerial-shuffle-build"
+APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
+DMG_PATH="$SCRIPT_DIR/$APP_NAME.dmg"
 
 echo "=== Cleaning ==="
-rm -rf "$BUILD_DIR" "$PKG_PATH"
+rm -rf "$BUILD_DIR" "$DMG_PATH" 2>/dev/null || true
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-mkdir -p "$SCRIPTS_DIR"
 
 echo "=== Compiling ==="
-swiftc -target arm64-apple-macos14 -framework AppKit -framework SwiftUI -lsqlite3 \
+swiftc -target arm64-apple-macos14 -framework AppKit -framework SwiftUI \
     -O -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     "$SCRIPT_DIR/AerialShuffle.swift"
 
@@ -57,7 +54,6 @@ for (px, filename) in sizes {
     let rect = NSRect(x: 0, y: 0, width: size, height: size)
     let radius = size * 0.2
 
-    // Background gradient
     let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
     let bg = NSGradient(
         starting: NSColor(red: 0.15, green: 0.45, blue: 0.75, alpha: 1.0),
@@ -65,7 +61,6 @@ for (px, filename) in sizes {
     )!
     bg.draw(in: path, angle: -90)
 
-    // SF Symbol in white
     let symConfig = NSImage.SymbolConfiguration(pointSize: size * 0.45, weight: .medium)
         .applying(.init(hierarchicalColor: .white))
     if let symbol = NSImage(systemSymbolName: "mountain.2.fill", accessibilityDescription: nil)?
@@ -86,7 +81,6 @@ ICONSWIFT
 swiftc -target arm64-apple-macos14 -framework AppKit "$BUILD_DIR/gen_icon.swift" -o "$BUILD_DIR/gen_icon"
 "$BUILD_DIR/gen_icon" "$ICONSET_DIR"
 
-# Verify iconset has files
 ICON_COUNT=$(ls "$ICONSET_DIR"/*.png 2>/dev/null | wc -l | tr -d ' ')
 if [ "$ICON_COUNT" -eq 0 ]; then
     echo "ERROR: Icon generation produced no PNGs"
@@ -128,41 +122,20 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-echo "=== Creating postinstall script ==="
-cat > "$SCRIPTS_DIR/postinstall" << 'EOF'
-#!/bin/bash
-# Create config directory for the installing user
-CONSOLE_USER=$(stat -f "%Su" /dev/console)
-CONSOLE_HOME=$(dscl . -read /Users/"$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')
-CONFIG_DIR="$CONSOLE_HOME/Library/Application Support/AerialShuffle"
-ACTIVE_DIR="$CONFIG_DIR/active"
+echo "=== Signing ==="
+codesign --force --sign - "$APP_BUNDLE"
 
-mkdir -p "$ACTIVE_DIR"
-chown -R "$CONSOLE_USER" "$CONFIG_DIR"
-chown -R "$CONSOLE_USER" /Applications/AerialShuffle.app
+echo "=== Creating DMG ==="
+DMG_STAGING="$BUILD_DIR/dmg"
+mkdir -p "$DMG_STAGING"
+cp -R "$APP_BUNDLE" "$DMG_STAGING/"
+ln -s /Applications "$DMG_STAGING/Applications"
 
-# Kill any existing instance (SIGTERM so it can restore refresh rate)
-killall AerialShuffle 2>/dev/null || true
-sleep 1
-
-# Launch the app as the console user
-su "$CONSOLE_USER" -c 'open /Applications/AerialShuffle.app'
-
-exit 0
-EOF
-chmod +x "$SCRIPTS_DIR/postinstall"
-
-echo "=== Building PKG ==="
-pkgbuild \
-    --root "$PAYLOAD_DIR" \
-    --scripts "$SCRIPTS_DIR" \
-    --identifier "$BUNDLE_ID" \
-    --version "$VERSION" \
-    --install-location / \
-    "$PKG_PATH"
+hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGING" \
+    -ov -format UDZO "$DMG_PATH"
 
 echo ""
 echo "=== Done ==="
-echo "PKG: $PKG_PATH"
+echo "DMG: $DMG_PATH"
 echo ""
-echo "To install:  open $PKG_PATH"
+echo "To install:  open $DMG_PATH"

@@ -68,7 +68,7 @@ The included build process creates a PKG installer that:
 
 On first launch, macOS will prompt for:
 - **Accessibility** — for intercepting the lock screen shortcut (Ctrl+Cmd+Q)
-- **Input Monitoring** — for receiving keyboard events through the event tap
+- **Full Disk Access** — for reading Apple's wallpaper data and the aerial shuffle database
 
 ### 5. Configure desktop wallpaper
 
@@ -103,7 +103,7 @@ The app maintains a folder of symlinks (`active/`) pointing to stills matching t
 Use the **Uninstall** option in the menu bar dropdown. It removes:
 - The app from `/Applications`
 - Config directory at `~/Library/Application Support/AerialShuffle/`
-- TCC permission entries (Accessibility, Input Monitoring, Full Disk Access)
+- TCC permission entries (Accessibility, Full Disk Access)
 - Launch at login registration
 
 Note: Aerial stills in `~/Library/Application Support/com.apple.wallpaper/aerials/stills/` are preserved.
