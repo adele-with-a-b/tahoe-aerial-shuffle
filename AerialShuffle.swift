@@ -240,6 +240,18 @@ class AppState: ObservableObject {
     }
 
     func listenForUnlock() {
+        // Screensaver started (idle timeout, hot corner, etc.) — shuffle + pin 60Hz
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.screensaver.didstart"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.lockHandler?.isScreenLocked = true
+            DispatchQueue.global().async {
+                self.shuffle()
+                self.pinTo60Hz()
+            }
+        }
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("com.apple.screenIsLocked"),
             object: nil, queue: .main
