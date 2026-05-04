@@ -123,7 +123,15 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 EOF
 
 echo "=== Signing ==="
-codesign --force --sign - "$APP_BUNDLE"
+# Self-signed cert in login keychain. Stable identity -> TCC grants persist
+# across rebuilds. Fall back to ad-hoc if the cert is missing.
+SIGN_IDENTITY="6F076E21982A86045FED6BCC68B7CC5682444F7D"
+if security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
+  codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime "$APP_BUNDLE"
+else
+  echo "WARNING: AerialShuffle cert not found in keychain, falling back to ad-hoc"
+  codesign --force --sign - "$APP_BUNDLE"
+fi
 
 echo "=== Creating DMG ==="
 DMG_STAGING="$BUILD_DIR/dmg"
