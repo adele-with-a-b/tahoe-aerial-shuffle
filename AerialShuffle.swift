@@ -219,8 +219,15 @@ class AppState: ObservableObject {
     }
 
     func pinTo60Hz() {
+        // Idempotent: if we already pinned, don't re-save (which would overwrite
+        // the real pre-pin mode with the current 60Hz one and break restore).
+        // Ctrl+Cmd+Q path calls this directly, then ScreenSaverEngine posts
+        // com.apple.screensaver.didstart which would call it again.
+        if savedDisplayMode != nil { return }
         let displayID = CGMainDisplayID()
         guard let currentMode = CGDisplayCopyDisplayMode(displayID) else { return }
+        // Extra guard: never record 60Hz as "the mode to restore".
+        if currentMode.refreshRate == 60.0 { return }
         savedDisplayMode = currentMode
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
         guard let allModes = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] else { return }
