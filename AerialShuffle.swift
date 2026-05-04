@@ -252,6 +252,18 @@ class AppState: ObservableObject {
                 self.pinTo60Hz()
             }
         }
+        // Screensaver stopped without showing the login window (unlock-without-password
+        // case). screenIsUnlocked only fires when the login window actually appeared;
+        // if the grace period catches it first, only didstop fires. Restore refresh
+        // rate here so ProMotion comes back in both cases. Calling restoreRefreshRate
+        // twice is safe — it guards on savedDisplayMode being non-nil.
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.screensaver.didstop"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.lockHandler?.isScreenLocked = false
+            self?.restoreRefreshRate()
+        }
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("com.apple.screenIsLocked"),
             object: nil, queue: .main
