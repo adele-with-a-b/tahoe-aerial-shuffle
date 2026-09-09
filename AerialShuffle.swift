@@ -342,6 +342,11 @@ class AppState: ObservableObject {
 
     func shuffle() {
         guard fdaGranted else { return }
+        // Only rotate the lock-screen aerial while the screen is actually locked. The
+        // killall below restarts the shared wallpaper process, which re-composites the
+        // DESKTOP wallpaper too; running it while unlocked makes the desktop flash every
+        // interval (visible with short intervals), so skip when nothing is watching.
+        guard lockHandler?.isScreenLocked == true else { return }
         guard let current = shellSqlite("SELECT ZCURRENTID FROM ZPERSISTENTSHUFFLEORDER WHERE Z_PK=1"),
               !current.isEmpty else { return }
         let fileIDs = Set((try? FileManager.default.contentsOfDirectory(atPath: videosDir))?.filter { $0.hasSuffix(".mov") }.map { $0.replacingOccurrences(of: ".mov", with: "") } ?? [])
