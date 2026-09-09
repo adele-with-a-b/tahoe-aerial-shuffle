@@ -46,7 +46,7 @@ Extract a 4K PNG frame from each aerial video for desktop wallpaper use:
 mkdir -p ~/Library/Application\ Support/com.apple.wallpaper/aerials/stills
 for f in ~/Library/Application\ Support/com.apple.wallpaper/aerials/videos/*.mov; do
     id=$(basename "$f" .mov)
-    ffmpeg -i "$f" -vframes 1 -q:v 1 \
+    ffmpeg -i "$f" -frames:v 1 -update 1 \
         ~/Library/Application\ Support/com.apple.wallpaper/aerials/stills/"$id".png 2>/dev/null
 done
 ```
