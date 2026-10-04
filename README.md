@@ -7,7 +7,7 @@ A macOS Tahoe menu bar app that shuffles Apple aerial wallpapers on both the des
 ## What It Does
 
 - **Desktop wallpaper shuffle** — Cycles through 4K PNG stills extracted from Apple aerial videos using native macOS photo folder shuffle with smooth crossfade transitions
-- **Lock screen aerial shuffle** — Rotates which aerial video plays on the lock screen by updating the system shuffle database on a configurable timer
+- **Lock screen aerial shuffle** — Picks a different aerial each time you lock with Ctrl+Cmd+Q, by updating the system shuffle database just before the screensaver starts
 - **Lock screen interception** — Intercepts Ctrl+Cmd+Q (the standard macOS lock shortcut), pins the display to a fixed 60Hz refresh rate to prevent ProMotion's adaptive mode from throttling during the screensaver, then launches the screensaver so aerials start playing immediately on the lock screen. The original adaptive refresh rate is restored automatically when the user unlocks.
 - **ESC to sleep** — Pressing ESC on the lock screen sleeps the display
 - **Category filters** — Independent category selection for desktop photos and lock screen aerials:
@@ -15,7 +15,7 @@ A macOS Tahoe menu bar app that shuffles Apple aerial wallpapers on both the des
   - 🏙️ Cityscape
   - 🐠 Underwater
   - 🌍 Earth
-- **Menu bar controls** — NSMenu dropdown with live-updating category checkboxes, shuffle interval picker, and current aerial name display
+- **Menu bar controls** — NSMenu dropdown with live-updating category checkboxes and current aerial name display
 
 ## Screenshots
 
@@ -23,7 +23,7 @@ A macOS Tahoe menu bar app that shuffles Apple aerial wallpapers on both the des
 
 ## Requirements
 
-- macOS Tahoe (26.x) on Apple Silicon (M-series)
+- macOS Tahoe (26.x) or macOS 27 on Apple Silicon (M-series)
 - Apple aerial videos (downloaded automatically via included script)
 - System Settings → Screensaver set to "Shuffle All Aerials"
 - System Settings → Lock Screen → "Require password after screen saver begins or display is turned off" set to Immediately (the app only starts the screensaver; this setting is what locks)
@@ -86,16 +86,19 @@ The app manages this folder with symlinks based on your category selection.
 
 The app uses an active CGEvent tap (`.defaultTap`) to intercept Ctrl+Cmd+Q keypresses. When detected, the event is consumed (preventing the default instant-lock behavior) and replaced with a custom sequence:
 
-1. **Refresh rate pin** — The display is switched from adaptive ProMotion to a fixed 60Hz mode, preventing macOS from throttling the refresh rate during the screensaver (which makes aerial videos look sluggish)
-2. **Screensaver launch** — `ScreenSaverEngine` is opened so the aerial video starts playing immediately; macOS's "require password" setting handles the actual screen lock
+1. **Next aerial** — The next lock screen aerial is picked (see Aerial Shuffle below)
+2. **Refresh rate pin** — The display is switched from adaptive ProMotion to a fixed 60Hz mode, preventing macOS from throttling the refresh rate during the screensaver (which makes aerial videos look sluggish)
+3. **Screensaver launch** — `ScreenSaverEngine` is opened so the aerial video starts playing immediately; macOS's "require password" setting handles the actual screen lock
 
 When the user unlocks, the app listens for the `com.apple.screenIsUnlocked` distributed notification and restores the original adaptive display mode.
 
 ### Aerial Shuffle
 
-The app updates `ZCURRENTID` in the system shuffle database at `~/Library/Containers/com.apple.wallpaper.extension.aerials/Data/Library/Application Support/Shuffle/ShuffleOrder.db`, then kills `WallpaperAerialsExtension` to force a reload. It does this only while the screen is locked, because restarting the extension redraws the desktop too.
+On each Ctrl+Cmd+Q, before the screensaver starts, the app updates `ZCURRENTID` in the system shuffle database at `~/Library/Containers/com.apple.wallpaper.extension.aerials/Data/Library/Application Support/Shuffle/ShuffleOrder.db`, then sends SIGTERM to `WallpaperAgent`. launchd restarts the agent, the restart ends the running `WallpaperAerialsExtension`, and a fresh extension connects in about half a second; the app waits for it (up to 3 s) before starting the screensaver.
 
-The database holds one row whose `Z_PK` is not stable: it was 1 on macOS 26 and 19 after the macOS 27 upgrade. The app therefore uses the most recently modified row. Each attempt overwrites `~/Library/Application Support/AerialShuffle/last-shuffle.txt` with one line: `ok: row N …: old -> new`, or the check that failed and sqlite3's error. Read that file first when the lock screen stops changing.
+The app never changes the aerial while the screensaver is showing. On macOS 26 it did that on a timer by force-killing `WallpaperAerialsExtension`. On macOS 27 that kill breaks the agent's connection to the extension (`NSCocoaErrorDomain 4099` in `log show --predicate 'process == "WallpaperAgent"'`), and the lock screen shows a static fallback image until the agent restarts. A screensaver started by idle timeout or a hot corner plays whatever aerial is loaded.
+
+The database holds one row whose `Z_PK` is not stable: it was 1 on macOS 26 and 19 after the macOS 27 upgrade. The app therefore uses the most recently modified row. Each attempt overwrites `~/Library/Application Support/AerialShuffle/last-shuffle.txt` with one line: `ok: row N …: old -> new; agent … restarted, extension … up in Ns; ZCURRENTID now …`, or the check that failed and sqlite3's error. Read that file first when the lock screen stops changing.
 
 ### Desktop Photo Shuffle
 

@@ -123,7 +123,6 @@ class LockScreenHandler {
 // MARK: - App State
 
 class AppState: ObservableObject {
-    @Published var interval: Int = 300
     @Published var desktopCategories: Set<String> = Set(aerialCategories.map { $0.id })
     @Published var aerialCats: Set<String> = Set(aerialCategories.map { $0.id })
     @Published var aerialCount: Int = 0
@@ -212,6 +211,9 @@ class AppState: ObservableObject {
 
     func handleLockScreen() {
         DispatchQueue.global().async {
+            // Pick the next aerial before the screensaver starts: on macOS 27 it can't be
+            // changed while the screensaver is showing (see shuffle()).
+            self.shuffle()
             self.pinTo60Hz()
             let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/open")
             t.arguments = ["-a", "ScreenSaverEngine"]; try? t.run()
@@ -247,17 +249,15 @@ class AppState: ObservableObject {
     }
 
     func listenForUnlock() {
-        // Screensaver started (idle timeout, hot corner, etc.) — shuffle + pin 60Hz
+        // Screensaver started (idle timeout, hot corner, etc.) — pin 60Hz. No shuffle here:
+        // the aerial is already loaded by now, and switching it would break the lock screen.
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("com.apple.screensaver.didstart"),
             object: nil, queue: .main
         ) { [weak self] _ in
             guard let self = self else { return }
             self.lockHandler?.isScreenLocked = true
-            DispatchQueue.global().async {
-                self.shuffle()
-                self.pinTo60Hz()
-            }
+            DispatchQueue.global().async { self.pinTo60Hz() }
         }
         // Screensaver stopped without showing the login window (unlock-without-password
         // case). screenIsUnlocked only fires when the login window actually appeared;
@@ -302,13 +302,12 @@ class AppState: ObservableObject {
     func loadConfig() {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: configFile)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if let i = json["interval"] as? Int { interval = i }
         if let c = json["desktopCategories"] as? [String] { desktopCategories = Set(c) }
         if let c = json["aerialCategories"] as? [String] { aerialCats = Set(c) }
     }
 
     func saveConfig() {
-        let json: [String: Any] = ["interval": interval, "desktopCategories": Array(desktopCategories), "aerialCategories": Array(aerialCats)]
+        let json: [String: Any] = ["desktopCategories": Array(desktopCategories), "aerialCategories": Array(aerialCats)]
         if let data = try? JSONSerialization.data(withJSONObject: json) { try? data.write(to: URL(fileURLWithPath: configFile)) }
     }
 
@@ -351,14 +350,14 @@ class AppState: ObservableObject {
         try? "\(f.string(from: Date())) \(msg)\n".write(toFile: shuffleStatusFile, atomically: true, encoding: .utf8)
     }
 
+    // Picks the next lock-screen aerial. Runs on Ctrl+Cmd+Q, just before the screensaver starts.
+    // macOS 27 can't switch the aerial while the screensaver is showing: killing
+    // WallpaperAerialsExtension (what this did on macOS 26) breaks WallpaperAgent's connection to
+    // it (NSCocoaErrorDomain 4099), and the lock screen shows a static fallback image until the
+    // agent restarts. So this writes ZCURRENTID and then restarts WallpaperAgent; launchd brings it
+    // back (KeepAlive), the restart ends the old extension, and a fresh one connects in ~0.5 s.
     func shuffle() {
         guard fdaGranted else { recordShuffle("skipped: no Full Disk Access"); return }
-        // Only rotate the lock-screen aerial while the screen is actually locked. The
-        // killall below restarts the shared wallpaper process, which re-composites the
-        // DESKTOP wallpaper too; running it while unlocked makes the desktop flash every
-        // interval (visible with short intervals), so skip when nothing is watching.
-        // (Not recorded: last-shuffle.txt keeps the last attempt made while locked.)
-        guard lockHandler?.isScreenLocked == true else { return }
         // The row's Z_PK is not stable: Core Data re-creates it (it was 1 on macOS 26, 19 after the
         // macOS 27 upgrade). Take the most recently modified row instead of a fixed key.
         let row = (shellSqlite("SELECT Z_PK || '|' || ifnull(ZCURRENTID, '') || '|' || ifnull(ZKEY, '') FROM ZPERSISTENTSHUFFLEORDER ORDER BY ZDATEMODIFIED DESC LIMIT 1") ?? "")
@@ -381,9 +380,41 @@ class AppState: ObservableObject {
         guard let next = pool.randomElement() else { recordShuffle("skipped: empty pool"); return }
         recentIDs.append(next); if recentIDs.count > 20 { recentIDs.removeFirst() }
         _ = shellSqlite("UPDATE ZPERSISTENTSHUFFLEORDER SET ZCURRENTID='\(next)' WHERE Z_PK=\(pk)")
-        recordShuffle(lastSqliteError.isEmpty ? "ok: row \(pk) (key \(key)): \(current) -> \(next)" : "failed: update row \(pk); sqlite3: \(lastSqliteError)")
-        let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        t.arguments = ["-9", "WallpaperAerialsExtension"]; try? t.run()
+        guard lastSqliteError.isEmpty else { recordShuffle("failed: update row \(pk); sqlite3: \(lastSqliteError)"); return }
+        let restart = restartWallpaperAgent()
+        // Read back after the restart: shows whether the new extension kept the ID we wrote.
+        let now = shellSqlite("SELECT ifnull(ZCURRENTID, '') FROM ZPERSISTENTSHUFFLEORDER WHERE Z_PK=\(pk)") ?? "?"
+        recordShuffle("ok: row \(pk) (key \(key)): \(current) -> \(next); \(restart); ZCURRENTID now \(now)")
+    }
+
+    func pids(named name: String) -> Set<Int32> {
+        let p = Process(); let pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        p.arguments = ["-x", name]; p.standardOutput = pipe
+        try? p.run(); p.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return Set(out.split(separator: "\n").compactMap { Int32($0) })
+    }
+
+    // SIGTERM, not launchctl kickstart (SIP refuses that for this job). Waits up to 3 s for the
+    // new aerial extension so the screensaver doesn't start against a half-connected one.
+    // Returns a status for last-shuffle.txt.
+    func restartWallpaperAgent() -> String {
+        let agents = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.wallpaper.agent")
+        guard agents.count == 1 else { return "agent not restarted: \(agents.count) WallpaperAgent processes" }
+        let agentPid = agents[0].processIdentifier
+        let oldExtensions = pids(named: "WallpaperAerialsExtension")
+        guard kill(agentPid, SIGTERM) == 0 else { return "agent not restarted: kill: \(String(cString: strerror(errno)))" }
+        let start = Date()
+        while Date().timeIntervalSince(start) < 3 {
+            usleep(100_000)
+            if let ext = pids(named: "WallpaperAerialsExtension").subtracting(oldExtensions).first {
+                let secs = Date().timeIntervalSince(start)
+                usleep(300_000)
+                return String(format: "agent %d restarted, extension %d up in %.1fs", agentPid, ext, secs)
+            }
+        }
+        return "agent \(agentPid) restarted, no new extension within 3s"
     }
 
     func updateCounts() {
@@ -427,15 +458,11 @@ class ToggleMenuItemView: NSView {
     var button: NSButton!
     var toggleAction: (() -> Void)?
 
-    init(title: String, checked: Bool, isRadio: Bool = false, toggle: @escaping () -> Void) {
+    init(title: String, checked: Bool, toggle: @escaping () -> Void) {
         super.init(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
         self.toggleAction = toggle
 
-        if isRadio {
-            button = NSButton(radioButtonWithTitle: title, target: self, action: #selector(toggled))
-        } else {
-            button = NSButton(checkboxWithTitle: title, target: self, action: #selector(toggled))
-        }
+        button = NSButton(checkboxWithTitle: title, target: self, action: #selector(toggled))
         button.state = checked ? .on : .off
         button.font = .menuFont(ofSize: 14)
         button.frame = NSRect(x: 18, y: 0, width: 230, height: 24)
@@ -455,19 +482,12 @@ func makeCheckboxItem(title: String, checked: Bool, toggle: @escaping () -> Void
     return item
 }
 
-func makeRadioItem(title: String, checked: Bool, toggle: @escaping () -> Void) -> NSMenuItem {
-    let item = NSMenuItem()
-    item.view = ToggleMenuItemView(title: title, checked: checked, isRadio: true, toggle: toggle)
-    return item
-}
-
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var state: AppState!
     var lockHandler: LockScreenHandler!
-    var shuffleTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let appPath = Bundle.main.bundlePath
@@ -499,20 +519,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lockHandler.appState = state
         state.lockHandler = lockHandler
         lockHandler.start()
-        startShuffleTimer()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "mountain.2.fill", accessibilityDescription: "Aerial Shuffle")
             button.action = #selector(showMenu)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        }
-    }
-
-    func startShuffleTimer() {
-        shuffleTimer?.invalidate()
-        shuffleTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(state.interval), repeats: true) { [weak self] _ in
-            self?.state.shuffle()
         }
     }
 
@@ -569,21 +581,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             })
         }
 
-        let ii = NSMenuItem(title: "  Shuffle Every", action: nil, keyEquivalent: "")
-        let isub = NSMenu()
-        var radioViews: [ToggleMenuItemView] = []
-        let intervals: [(String, Int)] = [("5 seconds", 5), ("1 minute", 60), ("3 minutes", 180), ("5 minutes", 300), ("10 minutes", 600), ("20 minutes", 1200)]
-        for (name, val) in intervals {
-            let item = makeRadioItem(title: name, checked: state.interval == val) { [weak self] in
-                self?.state.interval = val; self?.state.saveConfig(); self?.startShuffleTimer()
-                for rv in radioViews { rv.button.state = .off }
-                if let v = radioViews.first(where: { $0.button.title == name }) { v.button.state = .on }
-            }
-            radioViews.append(item.view as! ToggleMenuItemView)
-            isub.addItem(item)
-        }
-        ii.submenu = isub
-        menu.addItem(ii)
 
         if !state.currentName.isEmpty {
             menu.addItem(NSMenuItem.separator())
