@@ -26,7 +26,8 @@ A macOS Tahoe menu bar app that shuffles Apple aerial wallpapers on both the des
 - macOS Tahoe (26.x) on Apple Silicon (M-series)
 - Apple aerial videos (downloaded automatically via included script)
 - System Settings → Screensaver set to "Shuffle All Aerials"
-- A keyboard with a lock screen key mapped to Ctrl+Cmd+Q (e.g. Keychron)
+- System Settings → Lock Screen → "Require password after screen saver begins or display is turned off" set to Immediately (the app only starts the screensaver; this setting is what locks)
+- A keyboard with a lock screen key mapped to Ctrl+Cmd+Q. On a Keychron, set the key in Keychron Launcher to `LCTL(LGUI(KC_Q))` (hex `0x0914`). A firmware update resets custom keys, so re-apply it, or re-import a keymap export, after every flash
 
 ## Setup
 
@@ -92,7 +93,9 @@ When the user unlocks, the app listens for the `com.apple.screenIsUnlocked` dist
 
 ### Aerial Shuffle
 
-The app updates `ZCURRENTID` in the system shuffle database at `~/Library/Containers/com.apple.wallpaper.extension.aerials/Data/Library/Application Support/Shuffle/ShuffleOrder.db`, then kills `WallpaperAerialsExtension` to force a reload.
+The app updates `ZCURRENTID` in the system shuffle database at `~/Library/Containers/com.apple.wallpaper.extension.aerials/Data/Library/Application Support/Shuffle/ShuffleOrder.db`, then kills `WallpaperAerialsExtension` to force a reload. It does this only while the screen is locked, because restarting the extension redraws the desktop too.
+
+The database holds one row whose `Z_PK` is not stable: it was 1 on macOS 26 and 19 after the macOS 27 upgrade. The app therefore uses the most recently modified row. Each attempt overwrites `~/Library/Application Support/AerialShuffle/last-shuffle.txt` with one line: `ok: row N …: old -> new`, or the check that failed and sqlite3's error. Read that file first when the lock screen stops changing.
 
 ### Desktop Photo Shuffle
 
