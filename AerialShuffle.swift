@@ -330,33 +330,58 @@ class AppState: ObservableObject {
         desktopFilteredCount = count
     }
 
+    var lastSqliteError = ""
+
     func shellSqlite(_ sql: String) -> String? {
-        let p = Process(); let pipe = Pipe()
+        let p = Process(); let pipe = Pipe(); let errPipe = Pipe()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
         p.arguments = [dbPath, sql]
-        p.standardOutput = pipe; p.standardError = nil
+        p.standardOutput = pipe; p.standardError = errPipe
         try? p.run(); p.waitUntilExit()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        lastSqliteError = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // One line, overwritten on every attempt: why the lock screen aerial did or didn't change.
+    var shuffleStatusFile: String { "\(configDir)/last-shuffle.txt" }
+    func recordShuffle(_ msg: String) {
+        let f = ISO8601DateFormatter(); f.timeZone = .current
+        try? "\(f.string(from: Date())) \(msg)\n".write(toFile: shuffleStatusFile, atomically: true, encoding: .utf8)
+    }
+
     func shuffle() {
-        guard fdaGranted else { return }
+        guard fdaGranted else { recordShuffle("skipped: no Full Disk Access"); return }
         // Only rotate the lock-screen aerial while the screen is actually locked. The
         // killall below restarts the shared wallpaper process, which re-composites the
         // DESKTOP wallpaper too; running it while unlocked makes the desktop flash every
         // interval (visible with short intervals), so skip when nothing is watching.
+        // (Not recorded: last-shuffle.txt keeps the last attempt made while locked.)
         guard lockHandler?.isScreenLocked == true else { return }
-        guard let current = shellSqlite("SELECT ZCURRENTID FROM ZPERSISTENTSHUFFLEORDER WHERE Z_PK=1"),
-              !current.isEmpty else { return }
+        // The row's Z_PK is not stable: Core Data re-creates it (it was 1 on macOS 26, 19 after the
+        // macOS 27 upgrade). Take the most recently modified row instead of a fixed key.
+        let row = (shellSqlite("SELECT Z_PK || '|' || ifnull(ZCURRENTID, '') || '|' || ifnull(ZKEY, '') FROM ZPERSISTENTSHUFFLEORDER ORDER BY ZDATEMODIFIED DESC LIMIT 1") ?? "")
+            .components(separatedBy: "|")
+        guard row.count == 3, let pk = Int(row[0]) else {
+            let err = lastSqliteError.isEmpty ? "(no error)" : lastSqliteError
+            let flat = { (s: String?) in (s ?? "").replacingOccurrences(of: "\n", with: " | ") }
+            let rows = flat(shellSqlite("SELECT Z_PK || '=' || ifnull(ZCURRENTID, 'NULL') FROM ZPERSISTENTSHUFFLEORDER"))
+            let schema = flat(shellSqlite(".schema ZPERSISTENTSHUFFLEORDER"))
+            let tables = flat(shellSqlite(".tables"))
+            recordShuffle("failed: no shuffle-order row; sqlite3: \(err)\n  rows: \(rows)\n  tables: \(tables)\n  schema: \(schema)")
+            return
+        }
+        let current = row[1], key = row[2]
         let fileIDs = Set((try? FileManager.default.contentsOfDirectory(atPath: videosDir))?.filter { $0.hasSuffix(".mov") }.map { $0.replacingOccurrences(of: ".mov", with: "") } ?? [])
         let ids = allAerials.filter { fileIDs.contains($0.id) && aerialCats.contains($0.category) }.map { $0.id }
-        guard ids.count >= 2 else { return }
+        guard ids.count >= 2 else { recordShuffle("skipped: only \(ids.count) eligible aerials"); return }
         let candidates = ids.filter { !recentIDs.contains($0) && $0 != current }
         let pool = candidates.isEmpty ? ids.filter { $0 != current } : candidates
-        guard let next = pool.randomElement() else { return }
+        guard let next = pool.randomElement() else { recordShuffle("skipped: empty pool"); return }
         recentIDs.append(next); if recentIDs.count > 20 { recentIDs.removeFirst() }
-        _ = shellSqlite("UPDATE ZPERSISTENTSHUFFLEORDER SET ZCURRENTID='\(next)' WHERE Z_PK=1")
+        _ = shellSqlite("UPDATE ZPERSISTENTSHUFFLEORDER SET ZCURRENTID='\(next)' WHERE Z_PK=\(pk)")
+        recordShuffle(lastSqliteError.isEmpty ? "ok: row \(pk) (key \(key)): \(current) -> \(next)" : "failed: update row \(pk); sqlite3: \(lastSqliteError)")
         let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         t.arguments = ["-9", "WallpaperAerialsExtension"]; try? t.run()
     }
