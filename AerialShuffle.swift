@@ -1,63 +1,37 @@
 import AppKit
-import SwiftUI
 import ServiceManagement
 import ApplicationServices
 
-// MARK: - Categories
-
-struct AerialCategory: Identifiable, Hashable {
-    let id: String
-    let name: String
-    let keywords: [String]
-}
-
-let aerialCategories: [AerialCategory] = [
-    AerialCategory(id: "landscape", name: "Landscape", keywords: [
-        "tahoe", "sequoia", "yosemite", "patagonia", "iceland", "scotland", "hawaii",
-        "grand canyon", "monument valley", "cazadero", "redwood", "sonoma", "wildflower",
-        "goa", "liwa", "oregon", "waves", "beach", "field", "river", "greenland",
-        "cloud", "sunrise", "morning", "evening", "night", "day", "mac blue", "mac pink",
-        "mac purple", "mac yellow", "tea garden"
-    ]),
-    AerialCategory(id: "cityscape", name: "Cityscape", keywords: [
-        "york", "london", "dubai", "hong kong", "san francisco", "los angeles", "vegas"
-    ]),
-    AerialCategory(id: "underwater", name: "Underwater", keywords: [
-        "jelly", "coral", "shark", "seal", "ray", "barracuda", "kelp", "fish",
-        "star", "bumphead", "dolphin", "whale", "octopus", "palau"
-    ]),
-    AerialCategory(id: "earth", name: "Earth", keywords: [
-        "africa", "middle east", "asia", "europe", "atlantic", "caribbean",
-        "iran", "afghanistan", "korea", "japan", "spain", "france", "alps",
-        "himalayas", "india", "australia", "antarctica", "ireland", "north asia",
-        "south africa"
-    ])
-]
-
-func categorize(_ name: String) -> String {
-    let lower = name.lowercased()
-    for cat in aerialCategories where cat.id != "landscape" {
-        if cat.keywords.contains(where: { lower.contains($0) }) { return cat.id }
-    }
-    return "landscape"
-}
+// Two keys, nothing else. On macOS 27 the system shuffles the aerials itself (Screen Saver →
+// Shuffle All Aerials, Continuously) and the desktop stills are a plain folder shuffle, so this
+// app only adds what macOS doesn't do:
+//   Ctrl+Cmd+Q       → start the screensaver, which plays on every display. A plain macOS lock
+//                      plays video only on the main display.
+//   ESC while locked → turn the displays off. macOS does this on the plain lock screen, but not
+//                      while the screensaver is showing.
+// The README ("macOS 27") explains why the aerial switching and the 60 Hz pin were removed.
 
 // MARK: - Lock Screen Handler
 
 class LockScreenHandler {
     var tapRef: CFMachPort?
-    weak var appState: AppState?
     var isScreenLocked = false
     private var retryTimer: Timer?
 
     func start() {
         attemptTapCreation()
+        listenForLockState()
     }
 
     func stop() {
         retryTimer?.invalidate()
         retryTimer = nil
         if let tap = tapRef { CGEvent.tapEnable(tap: tap, enable: false) }
+    }
+
+    func startScreenSaver() {
+        let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        t.arguments = ["-a", "ScreenSaverEngine"]; try? t.run()
     }
 
     private func attemptTapCreation() {
@@ -82,12 +56,13 @@ class LockScreenHandler {
 
                     // Intercept Ctrl+Cmd+Q (lock screen shortcut)
                     if keycode == 0x0C && flags.contains(.maskCommand) && flags.contains(.maskControl) {
-                        handler.appState?.handleLockScreen()
+                        handler.startScreenSaver()
                         return nil // consume the event
                     }
 
                     // ESC -> display sleep (only when screen is locked)
                     if keycode == 0x35 && handler.isScreenLocked {
+                        NSLog("ESC while locked: putting the displays to sleep")
                         DispatchQueue.global().async {
                             let p = Process()
                             p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
@@ -118,375 +93,39 @@ class LockScreenHandler {
             }
         }
     }
-}
 
-// MARK: - App State
-
-class AppState: ObservableObject {
-    @Published var desktopCategories: Set<String> = Set(aerialCategories.map { $0.id })
-    @Published var aerialCats: Set<String> = Set(aerialCategories.map { $0.id })
-    @Published var aerialCount: Int = 0
-    @Published var desktopFilteredCount: Int = 0
-    @Published var aerialFilteredCount: Int = 0
-    @Published var currentName: String = ""
-    @Published var launchAtLogin: Bool = false
-
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    var configDir: String { "\(home)/Library/Application Support/AerialShuffle" }
-    var configFile: String { "\(configDir)/config.json" }
-    var stillsDir: String { "\(home)/Library/Application Support/com.apple.wallpaper/aerials/stills" }
-    var activeDir: String { "\(configDir)/active" }
-    var videosDir: String { "\(home)/Library/Application Support/com.apple.wallpaper/aerials/videos" }
-    var manifestPath: String { "\(home)/Library/Application Support/com.apple.wallpaper/aerials/manifest/entries.json" }
-    var dbPath: String { "\(home)/Library/Containers/com.apple.wallpaper.extension.aerials/Data/Library/Application Support/Shuffle/ShuffleOrder.db" }
-
-    struct AerialInfo { let id, name, shotID, category: String }
-
-    lazy var allAerials: [AerialInfo] = {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: manifestPath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let assets = json["assets"] as? [[String: Any]] else { return [] }
-        return assets.compactMap { a in
-            guard let id = a["id"] as? String, let name = a["accessibilityLabel"] as? String,
-                  let shotID = a["shotID"] as? String else { return nil }
-            return AerialInfo(id: id, name: name, shotID: shotID, category: categorize(name))
-        }
-    }()
-
-    lazy var idToAerial: [String: AerialInfo] = {
-        Dictionary(uniqueKeysWithValues: allAerials.map { ($0.id, $0) })
-    }()
-
-    var recentIDs: [String] = []
-    var savedDisplayMode: CGDisplayMode?
-    weak var lockHandler: LockScreenHandler?
-    var fdaGranted = false
-    var permissionTimer: Timer?
-
-    init() {
-        try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(atPath: activeDir, withIntermediateDirectories: true)
-        loadConfig()
-        launchAtLogin = SMAppService.mainApp.status == .enabled
-        listenForUnlock()
-        checkFDA()
-        if fdaGranted { onFDAGranted() }
-        startPermissionPolling()
+    // The window server's own lock flag. Present (true) only while the session is locked.
+    func sessionIsLocked() -> Bool {
+        let d = CGSessionCopyCurrentDictionary() as? [String: Any]
+        return (d?["CGSSessionScreenIsLocked"] as? Bool) ?? false
     }
 
-    func checkFDA() {
-        // Test FDA by reading ~/Library/Safari — FDA-protected, no per-app popup
-        let testPath = home + "/Library/Safari"
-        fdaGranted = (try? FileManager.default.contentsOfDirectory(atPath: testPath)) != nil
-    }
-
-    func onFDAGranted() {
-        rebuildActiveFrames()
-        updateCounts()
-        updateCurrentName()
-        setDesktopShuffle()
-    }
-
-    func startPermissionPolling() {
-        // Poll until both permissions granted, then stop
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] timer in
-            guard let self = self else { timer.invalidate(); return }
-            if !self.fdaGranted {
-                self.checkFDA()
-                if self.fdaGranted { self.onFDAGranted() }
-            }
-            // Stop polling once everything is granted
-            if self.fdaGranted {
-                timer.invalidate()
-                self.permissionTimer = nil
+    func listenForLockState() {
+        let center = DistributedNotificationCenter.default()
+        for name in ["com.apple.screensaver.didstart", "com.apple.screenIsLocked"] {
+            center.addObserver(forName: NSNotification.Name(name), object: nil, queue: .main) { [weak self] _ in
+                self?.isScreenLocked = true
             }
         }
-    }
-
-    func missingPermissions() -> [String] {
-        var missing: [String] = []
-        if !fdaGranted { missing.append("Full Disk Access") }
-        return missing
-    }
-
-    func handleLockScreen() {
-        DispatchQueue.global().async {
-            // Pick the next aerial before the screensaver starts: on macOS 27 it can't be
-            // changed while the screensaver is showing (see shuffle()).
-            self.shuffle()
-            self.pinTo60Hz()
-            let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            t.arguments = ["-a", "ScreenSaverEngine"]; try? t.run()
-        }
-    }
-
-    func pinTo60Hz() {
-        // Idempotent: if we already pinned, don't re-save (which would overwrite
-        // the real pre-pin mode with the current 60Hz one and break restore).
-        // Ctrl+Cmd+Q path calls this directly, then ScreenSaverEngine posts
-        // com.apple.screensaver.didstart which would call it again.
-        if savedDisplayMode != nil { return }
-        let displayID = CGMainDisplayID()
-        guard let currentMode = CGDisplayCopyDisplayMode(displayID) else { return }
-        // Extra guard: never record 60Hz as "the mode to restore".
-        if currentMode.refreshRate == 60.0 { return }
-        savedDisplayMode = currentMode
-        let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
-        guard let allModes = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode] else { return }
-        if let target = allModes.first(where: {
-            $0.width == currentMode.width && $0.height == currentMode.height &&
-            $0.pixelWidth == currentMode.pixelWidth && $0.pixelHeight == currentMode.pixelHeight &&
-            $0.refreshRate == 60.0
-        }) {
-            CGDisplaySetDisplayMode(displayID, target, nil)
-        }
-    }
-
-    func restoreRefreshRate() {
-        guard let mode = savedDisplayMode else { return }
-        CGDisplaySetDisplayMode(CGMainDisplayID(), mode, nil)
-        savedDisplayMode = nil
-    }
-
-    func listenForUnlock() {
-        // Screensaver started (idle timeout, hot corner, etc.) — pin 60Hz. No shuffle here:
-        // the aerial is already loaded by now, and switching it would break the lock screen.
-        DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.apple.screensaver.didstart"),
-            object: nil, queue: .main
-        ) { [weak self] _ in
+        // The screensaver stopping doesn't mean the screen unlocked: with "require password
+        // immediately" the password prompt is still up, and ESC there should still turn the
+        // displays off. screenIsUnlocked only fires when the login window actually appeared, so
+        // ask the window server whether the session is still locked.
+        center.addObserver(forName: NSNotification.Name("com.apple.screensaver.didstop"), object: nil, queue: .main) { [weak self] _ in
             guard let self = self else { return }
-            self.lockHandler?.isScreenLocked = true
-            DispatchQueue.global().async { self.pinTo60Hz() }
+            self.isScreenLocked = self.sessionIsLocked()
+            NSLog("Screensaver stopped; session locked = \(self.isScreenLocked)")
         }
-        // Screensaver stopped without showing the login window (unlock-without-password
-        // case). screenIsUnlocked only fires when the login window actually appeared;
-        // if the grace period catches it first, only didstop fires. Restore refresh
-        // rate here so ProMotion comes back in both cases. Calling restoreRefreshRate
-        // twice is safe — it guards on savedDisplayMode being non-nil.
-        DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.apple.screensaver.didstop"),
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.lockHandler?.isScreenLocked = false
-            self?.restoreRefreshRate()
-        }
-        DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.apple.screenIsLocked"),
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.lockHandler?.isScreenLocked = true
-        }
-        DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.apple.screenIsUnlocked"),
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.lockHandler?.isScreenLocked = false
-            self?.restoreRefreshRate()
+        center.addObserver(forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.isScreenLocked = false
         }
     }
-
-    func setDesktopShuffle() {
-        let url = URL(fileURLWithPath: activeDir)
-        let options: [NSWorkspace.DesktopImageOptionKey: Any] = [
-            .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
-            .allowClipping: true
-        ]
-        for screen in NSScreen.screens {
-            if NSWorkspace.shared.desktopImageURL(for: screen)?.path != activeDir {
-                try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: options)
-            }
-        }
-    }
-
-    func loadConfig() {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configFile)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if let c = json["desktopCategories"] as? [String] { desktopCategories = Set(c) }
-        if let c = json["aerialCategories"] as? [String] { aerialCats = Set(c) }
-    }
-
-    func saveConfig() {
-        let json: [String: Any] = ["desktopCategories": Array(desktopCategories), "aerialCategories": Array(aerialCats)]
-        if let data = try? JSONSerialization.data(withJSONObject: json) { try? data.write(to: URL(fileURLWithPath: configFile)) }
-    }
-
-    func setLaunchAtLogin(_ enabled: Bool) {
-        do { if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }; launchAtLogin = enabled }
-        catch { launchAtLogin = SMAppService.mainApp.status == .enabled }
-    }
-
-    func rebuildActiveFrames() {
-        if let files = try? FileManager.default.contentsOfDirectory(atPath: activeDir) {
-            for f in files { try? FileManager.default.removeItem(atPath: "\(activeDir)/\(f)") }
-        }
-        let stillIDs = Set((try? FileManager.default.contentsOfDirectory(atPath: stillsDir))?.filter { $0.hasSuffix(".png") }.map { $0.replacingOccurrences(of: ".png", with: "") } ?? [])
-        var count = 0
-        for a in allAerials where desktopCategories.contains(a.category) && stillIDs.contains(a.id) {
-            try? FileManager.default.createSymbolicLink(atPath: "\(activeDir)/\(a.id).png", withDestinationPath: "\(stillsDir)/\(a.id).png")
-            count += 1
-        }
-        desktopFilteredCount = count
-    }
-
-    var lastSqliteError = ""
-
-    func shellSqlite(_ sql: String) -> String? {
-        let p = Process(); let pipe = Pipe(); let errPipe = Pipe()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        p.arguments = [dbPath, sql]
-        p.standardOutput = pipe; p.standardError = errPipe
-        try? p.run(); p.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        lastSqliteError = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    // One line, overwritten on every attempt: why the lock screen aerial did or didn't change.
-    var shuffleStatusFile: String { "\(configDir)/last-shuffle.txt" }
-    func recordShuffle(_ msg: String) {
-        let f = ISO8601DateFormatter(); f.timeZone = .current
-        try? "\(f.string(from: Date())) \(msg)\n".write(toFile: shuffleStatusFile, atomically: true, encoding: .utf8)
-    }
-
-    // Picks the next lock-screen aerial. Runs on Ctrl+Cmd+Q, just before the screensaver starts.
-    // macOS 27 can't switch the aerial while the screensaver is showing: killing
-    // WallpaperAerialsExtension (what this did on macOS 26) breaks WallpaperAgent's connection to
-    // it (NSCocoaErrorDomain 4099), and the lock screen shows a static fallback image until the
-    // agent restarts. So this writes ZCURRENTID and then restarts WallpaperAgent; launchd brings it
-    // back (KeepAlive), the restart ends the old extension, and a fresh one connects in ~0.5 s.
-    func shuffle() {
-        guard fdaGranted else { recordShuffle("skipped: no Full Disk Access"); return }
-        // The row's Z_PK is not stable: Core Data re-creates it (it was 1 on macOS 26, 19 after the
-        // macOS 27 upgrade). Take the most recently modified row instead of a fixed key.
-        let row = (shellSqlite("SELECT Z_PK || '|' || ifnull(ZCURRENTID, '') || '|' || ifnull(ZKEY, '') FROM ZPERSISTENTSHUFFLEORDER ORDER BY ZDATEMODIFIED DESC LIMIT 1") ?? "")
-            .components(separatedBy: "|")
-        guard row.count == 3, let pk = Int(row[0]) else {
-            let err = lastSqliteError.isEmpty ? "(no error)" : lastSqliteError
-            let flat = { (s: String?) in (s ?? "").replacingOccurrences(of: "\n", with: " | ") }
-            let rows = flat(shellSqlite("SELECT Z_PK || '=' || ifnull(ZCURRENTID, 'NULL') FROM ZPERSISTENTSHUFFLEORDER"))
-            let schema = flat(shellSqlite(".schema ZPERSISTENTSHUFFLEORDER"))
-            let tables = flat(shellSqlite(".tables"))
-            recordShuffle("failed: no shuffle-order row; sqlite3: \(err)\n  rows: \(rows)\n  tables: \(tables)\n  schema: \(schema)")
-            return
-        }
-        let current = row[1], key = row[2]
-        let fileIDs = Set((try? FileManager.default.contentsOfDirectory(atPath: videosDir))?.filter { $0.hasSuffix(".mov") }.map { $0.replacingOccurrences(of: ".mov", with: "") } ?? [])
-        let ids = allAerials.filter { fileIDs.contains($0.id) && aerialCats.contains($0.category) }.map { $0.id }
-        guard ids.count >= 2 else { recordShuffle("skipped: only \(ids.count) eligible aerials"); return }
-        let candidates = ids.filter { !recentIDs.contains($0) && $0 != current }
-        let pool = candidates.isEmpty ? ids.filter { $0 != current } : candidates
-        guard let next = pool.randomElement() else { recordShuffle("skipped: empty pool"); return }
-        recentIDs.append(next); if recentIDs.count > 20 { recentIDs.removeFirst() }
-        _ = shellSqlite("UPDATE ZPERSISTENTSHUFFLEORDER SET ZCURRENTID='\(next)' WHERE Z_PK=\(pk)")
-        guard lastSqliteError.isEmpty else { recordShuffle("failed: update row \(pk); sqlite3: \(lastSqliteError)"); return }
-        let restart = restartWallpaperAgent()
-        // Read back after the restart: shows whether the new extension kept the ID we wrote.
-        let now = shellSqlite("SELECT ifnull(ZCURRENTID, '') FROM ZPERSISTENTSHUFFLEORDER WHERE Z_PK=\(pk)") ?? "?"
-        recordShuffle("ok: row \(pk) (key \(key)): \(current) -> \(next); \(restart); ZCURRENTID now \(now)")
-    }
-
-    func pids(named name: String) -> Set<Int32> {
-        let p = Process(); let pipe = Pipe()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-x", name]; p.standardOutput = pipe
-        try? p.run(); p.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return Set(out.split(separator: "\n").compactMap { Int32($0) })
-    }
-
-    // SIGTERM, not launchctl kickstart (SIP refuses that for this job). Waits up to 3 s for the
-    // new aerial extension so the screensaver doesn't start against a half-connected one.
-    // Returns a status for last-shuffle.txt.
-    func restartWallpaperAgent() -> String {
-        let agents = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.wallpaper.agent")
-        guard agents.count == 1 else { return "agent not restarted: \(agents.count) WallpaperAgent processes" }
-        let agentPid = agents[0].processIdentifier
-        let oldExtensions = pids(named: "WallpaperAerialsExtension")
-        guard kill(agentPid, SIGTERM) == 0 else { return "agent not restarted: kill: \(String(cString: strerror(errno)))" }
-        let start = Date()
-        while Date().timeIntervalSince(start) < 3 {
-            usleep(100_000)
-            if let ext = pids(named: "WallpaperAerialsExtension").subtracting(oldExtensions).first {
-                let secs = Date().timeIntervalSince(start)
-                usleep(300_000)
-                return String(format: "agent %d restarted, extension %d up in %.1fs", agentPid, ext, secs)
-            }
-        }
-        return "agent \(agentPid) restarted, no new extension within 3s"
-    }
-
-    func updateCounts() {
-        aerialCount = (try? FileManager.default.contentsOfDirectory(atPath: stillsDir))?.filter { $0.hasSuffix(".png") }.count ?? 0
-        desktopFilteredCount = (try? FileManager.default.contentsOfDirectory(atPath: activeDir))?.filter { $0.hasSuffix(".png") }.count ?? 0
-        let fileIDs = Set((try? FileManager.default.contentsOfDirectory(atPath: videosDir))?.filter { $0.hasSuffix(".mov") }.map { $0.replacingOccurrences(of: ".mov", with: "") } ?? [])
-        aerialFilteredCount = allAerials.filter { fileIDs.contains($0.id) && aerialCats.contains($0.category) }.count
-    }
-
-    func updateCurrentName() {
-        guard let screen = NSScreen.main, let url = NSWorkspace.shared.desktopImageURL(for: screen) else { return }
-        let filename = url.deletingPathExtension().lastPathComponent
-        if let a = idToAerial[filename] {
-            let same = allAerials.filter { $0.name == a.name }
-            if same.count > 1, let idx = same.sorted(by: { $0.shotID < $1.shotID }).firstIndex(where: { $0.id == a.id }) {
-                currentName = "\(a.name) (\(idx + 1) of \(same.count))"; return
-            }
-            currentName = a.name
-        }
-    }
-
-    func uninstall() {
-        restoreRefreshRate()
-        lockHandler?.stop()
-        try? SMAppService.mainApp.unregister()
-        // Remove config but preserve active/ — macOS wallpaper shuffle points to it
-        try? FileManager.default.removeItem(atPath: configFile)
-        UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "")
-        for service in ["Accessibility", "PostEvent", "SystemPolicyAllFiles", "SystemPolicyAppData"] {
-            let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            t.arguments = ["reset", service, "com.user.aerial-shuffle"]; try? t.run(); t.waitUntilExit()
-        }
-        try? FileManager.default.removeItem(atPath: Bundle.main.bundlePath)
-        NSApp.terminate(nil)
-    }
-}
-
-// MARK: - Checkbox Menu Item (NSView-based, doesn't close menu)
-
-class ToggleMenuItemView: NSView {
-    var button: NSButton!
-    var toggleAction: (() -> Void)?
-
-    init(title: String, checked: Bool, toggle: @escaping () -> Void) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
-        self.toggleAction = toggle
-
-        button = NSButton(checkboxWithTitle: title, target: self, action: #selector(toggled))
-        button.state = checked ? .on : .off
-        button.font = .menuFont(ofSize: 14)
-        button.frame = NSRect(x: 18, y: 0, width: 230, height: 24)
-        addSubview(button)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    @objc func toggled() {
-        toggleAction?()
-    }
-}
-
-func makeCheckboxItem(title: String, checked: Bool, toggle: @escaping () -> Void) -> NSMenuItem {
-    let item = NSMenuItem()
-    item.view = ToggleMenuItemView(title: title, checked: checked, toggle: toggle)
-    return item
 }
 
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
-    var state: AppState!
     var lockHandler: LockScreenHandler!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -508,16 +147,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        finishLaunch()
-
-    }
-
-    func finishLaunch() {
         NSApp.setActivationPolicy(.accessory)
-        state = AppState()
         lockHandler = LockScreenHandler()
-        lockHandler.appState = state
-        state.lockHandler = lockHandler
         lockHandler.start()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -529,75 +160,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showMenu() {
-        state.updateCurrentName()
-        state.updateCounts()
-
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        // Desktop Photo Shuffle
-        let dt = NSMenuItem()
-        let dtLabel = NSTextField(labelWithString: "")
-        dtLabel.font = .boldSystemFont(ofSize: 13)
-        dtLabel.textColor = .labelColor
-        func updateDT() { dtLabel.stringValue = "Desktop Photo Shuffle (\(self.state.desktopFilteredCount)/\(self.state.aerialCount))" }
-        updateDT()
-        let dtView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        dtLabel.frame = NSRect(x: 18, y: 2, width: 280, height: 20)
-        dtView.addSubview(dtLabel)
-        dt.view = dtView
-        menu.addItem(dt)
+        let li = NSMenuItem(title: "Start at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        li.target = self
+        li.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(li)
 
-        for cat in aerialCategories {
-            menu.addItem(makeCheckboxItem(title: "  \(cat.name)", checked: state.desktopCategories.contains(cat.id)) { [weak self] in
-                guard let s = self?.state else { return }
-                if s.desktopCategories.contains(cat.id) { s.desktopCategories.remove(cat.id) } else { s.desktopCategories.insert(cat.id) }
-                s.saveConfig(); s.rebuildActiveFrames(); s.updateCounts()
-                updateDT()
-            })
-        }
-
-        menu.addItem(NSMenuItem.separator())
-
-        // Lock Screen Aerials
-        let at = NSMenuItem()
-        let atLabel = NSTextField(labelWithString: "")
-        atLabel.font = .boldSystemFont(ofSize: 13)
-        atLabel.textColor = .labelColor
-        func updateAT() { atLabel.stringValue = "Lock Screen Aerials (\(self.state.aerialFilteredCount)/\(self.state.aerialCount))" }
-        updateAT()
-        let atView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        atLabel.frame = NSRect(x: 18, y: 2, width: 280, height: 20)
-        atView.addSubview(atLabel)
-        at.view = atView
-        menu.addItem(at)
-
-        for cat in aerialCategories {
-            menu.addItem(makeCheckboxItem(title: "  \(cat.name)", checked: state.aerialCats.contains(cat.id)) { [weak self] in
-                guard let s = self?.state else { return }
-                if s.aerialCats.contains(cat.id) { s.aerialCats.remove(cat.id) } else { s.aerialCats.insert(cat.id) }
-                s.saveConfig(); s.updateCounts()
-                updateAT()
-            })
-        }
-
-
-        if !state.currentName.isEmpty {
+        if !AXIsProcessTrusted() {
             menu.addItem(NSMenuItem.separator())
-            let n = NSMenuItem(title: "Now Playing: \(state.currentName)", action: nil, keyEquivalent: "")
-            n.isEnabled = false; menu.addItem(n)
-        }
-
-        menu.addItem(NSMenuItem.separator())
-
-        menu.addItem(makeCheckboxItem(title: "Start at Login", checked: state.launchAtLogin) { [weak self] in
-            guard let s = self?.state else { return }
-            s.setLaunchAtLogin(!s.launchAtLogin)
-        })
-
-        if !state.fdaGranted {
-            menu.addItem(NSMenuItem.separator())
-            let pw = NSMenuItem(title: "⚠️ Grant Full Disk Access", action: #selector(openFDA), keyEquivalent: "")
+            let pw = NSMenuItem(title: "⚠️ Grant Accessibility (needed for the keys)", action: #selector(openAccessibility), keyEquivalent: "")
             pw.target = self; menu.addItem(pw)
         }
 
@@ -614,30 +187,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = nil
     }
 
-    @objc func openFDA() {
+    @objc func toggleLaunchAtLogin() {
+        if SMAppService.mainApp.status == .enabled { try? SMAppService.mainApp.unregister() }
+        else { try? SMAppService.mainApp.register() }
+    }
+
+    @objc func openAccessibility() {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]
+        p.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]
         try? p.run()
     }
 
     @objc func doUninstall() {
         let alert = NSAlert()
         alert.messageText = "Uninstall AerialShuffle?"
-        alert.informativeText = "This will remove the app, config, and permissions (Accessibility, Full Disk Access)."
+        alert.informativeText = "This removes the app, its login item, and its permissions. Your wallpaper and screen saver settings are not changed."
         alert.addButton(withTitle: "Uninstall"); alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
-        if alert.runModal() == .alertFirstButtonReturn { state.uninstall() }
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        lockHandler.stop()
+        try? SMAppService.mainApp.unregister()
+        // Full Disk Access is from older versions, which edited the aerial shuffle database.
+        for service in ["Accessibility", "PostEvent", "SystemPolicyAllFiles", "SystemPolicyAppData"] {
+            let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            t.arguments = ["reset", service, "com.user.aerial-shuffle"]; try? t.run(); t.waitUntilExit()
+        }
+        try? FileManager.default.removeItem(atPath: Bundle.main.bundlePath)
+        NSApp.terminate(nil)
     }
 
     @objc func doQuit() {
-        state.restoreRefreshRate()
         lockHandler.stop()
         NSApp.terminate(nil)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        state?.restoreRefreshRate()
         lockHandler?.stop()
     }
 }

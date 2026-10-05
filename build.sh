@@ -14,7 +14,7 @@ rm -rf "$BUILD_DIR" "$DMG_PATH" 2>/dev/null || true
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 
 echo "=== Compiling ==="
-swiftc -target arm64-apple-macos14 -framework AppKit -framework SwiftUI \
+swiftc -target arm64-apple-macos14 -framework AppKit \
     -O -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     "$SCRIPT_DIR/AerialShuffle.swift"
 
